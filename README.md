@@ -56,14 +56,19 @@ build and port both take --overrides with a C file or a folder of them, for func
 
 ### The app
 
-There's also a desktop app that does analyze, build, port and hints without the terminal. Pick a game (or drop it on the window), press Build, and watch the log and progress bar. It still needs a C compiler, the same as the command line, and says so at the top if it can't find one.
+There's also a desktop app, so you don't need the terminal. Build it with
 
 ```
 cargo build --release -p recomp3ds-gui
 ./target/release/3dsrecomp-gui
 ```
 
-On Windows that makes `3dsrecomp-gui.exe`, a program of its own you can copy anywhere. You can also drop a game on the exe to open it right away.
+On Windows that makes `3dsrecomp-gui.exe`, which you can copy anywhere. Drop a game on the window, or on the exe, to open it.
+
+- Simple mode takes a game and makes it an exe of its own, the same as port followed by cargo build, plus a Play .bat next to it that starts it with the game. The first one takes a while, because Zakuro gets downloaded and compiled once.
+- Advanced mode has analyze, build, port and hints, with all their options.
+
+Both need a C compiler that builds for Windows itself. The gcc in MSYS2's or devkitPro's `/usr/bin` builds for Cygwin, and what it makes crashes outside MSYS, so the app turns it down. Making an exe also needs Rust, and with Rust's default MSVC toolchain the compiler has to be LLVM's clang (`winget install LLVM.LLVM`), see [docs/port.md](docs/port.md). The app looks where LLVM, MSYS2 and WinLibs install. The first time something is missing, it opens a setup window that installs Rust, Visual Studio's C++ Build Tools and LLVM with winget, and you can open it again from Settings.
 
 ## Notes
 

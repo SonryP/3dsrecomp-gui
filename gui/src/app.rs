@@ -1,4 +1,5 @@
 //! the window, a game card at the top, a page per thing to do, and the log at the bottom
+//! simple mode is one page that makes the game an exe, advanced has every page
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,10 +12,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::report::{Report, Totals};
 use crate::theme::{self, ACCENT, BAD, GOOD, WARN, WEAK};
-use crate::worker::{self, Job, Level, Msg, Out, TitleInfo};
+use crate::toolchain::{Recipe, Tools, RECIPES};
+use crate::worker::{self, Job, Level, Msg, Out, Port, TitleInfo};
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 enum Page {
+    /// simple mode's only page
+    Exe,
+    /// the setup window, which installs tools
+    Setup,
     #[default]
     Build,
     Analyze,
@@ -28,6 +34,8 @@ impl Page {
 
     fn label(self) -> &'static str {
         match self {
+            Page::Exe => "🎮  Make an exe",
+            Page::Setup => "🔧  Setup",
             Page::Build => "🔨  Build",
             Page::Analyze => "🔍  Analyze",
             Page::Port => "📦  Port",
@@ -38,11 +46,15 @@ impl Page {
 
     fn blurb(self) -> &'static str {
         match self {
+            Page::Setup => "Installs the tools making an exe takes.",
+            Page::Exe => {
+                "Turns the game into a Windows program of its own, its code recompiled and Zakuro running everything else."
+            }
             Page::Build => "Recompile the game into a library Zakuro loads on its own, or into a folder you pick.",
             Page::Analyze => "See how much of the game's code the recompiler finds, without building anything.",
-            Page::Port => "Make the game a program of its own, a cargo project with the recompiled code linked into Zakuro.",
+            Page::Port => "Make the game a cargo project with the recompiled code linked into Zakuro, and build it if you like.",
             Page::Hints => "Print the game's section for hints.txt, from where Zakuro had to interpret its last library.",
-            Page::Settings => "The C compiler and where things go.",
+            Page::Settings => "The tools it uses and where things go.",
         }
     }
 }
@@ -51,7 +63,15 @@ impl Page {
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 struct Settings {
+    /// every page instead of just making an exe
+    advanced: bool,
+    /// the setup window came up once already, on the first launch that lacked something
+    setup_seen: bool,
     page: Page,
+    /// where simple mode puts the exe, next to the game when empty
+    exe_dir: String,
+    /// port only writes the project, w/o building it
+    port_project_only: bool,
     rom: String,
     build_to_folder: bool,
     build_dir: String,
@@ -72,6 +92,8 @@ struct Running {
     started: Instant,
     stage: String,
     progress: Option<(usize, usize)>,
+    /// which of a port's steps it's on
+    step: usize,
 }
 
 struct Line {
@@ -91,8 +113,15 @@ pub struct App {
     logo: Option<TextureHandle>,
     title: Option<Result<TitleInfo, String>>,
     reading: bool,
-    compiler: Option<Result<String, String>>,
+    /// the compiler, ar and cargo found, None while looking
+    tools: Option<Tools>,
     running: Option<Running>,
+    /// the exe a port made last
+    exe: Option<PathBuf>,
+    /// the setup window is open
+    show_setup: bool,
+    /// what the setup is installing now
+    installing: Vec<&'static Recipe>,
     /// how the last job went, shown on its page
     outcome: Option<(Page, bool, String)>,
     log: Vec<Line>,
@@ -117,8 +146,11 @@ impl App {
             logo,
             title: None,
             reading: false,
-            compiler: None,
+            tools: None,
             running: None,
+            exe: None,
+            show_setup: false,
+            installing: Vec::new(),
             outcome: None,
             log: Vec::new(),
             report: None,
@@ -169,12 +201,31 @@ impl App {
                         self.title = Some(title);
                     }
                 }
-                Msg::Compiler(compiler) => self.compiler = Some(compiler),
+                Msg::Tools(tools) => {
+                    // the first launch that lacks something helps set it up, once
+                    if !self.settings.setup_seen && !tools.exe_ready() {
+                        self.show_setup = true;
+                    }
+                    self.settings.setup_seen = true;
+                    self.tools = Some(*tools);
+                }
+                Msg::Step(step) => {
+                    if let Some(running) = &mut self.running {
+                        running.step = step;
+                        running.progress = None;
+                    }
+                }
+                Msg::Exe(path) => self.exe = Some(path),
                 Msg::Analysis(report) => self.report = Some(report),
                 Msg::Hints(text) => self.hints = Some(text),
                 Msg::Done { ok, summary } => {
                     let what = self.running.take().map(|running| running.what);
                     self.outcome = what.map(|what| (what, ok, summary));
+                    // whatever got installed (or half of it) shows up once it's looked for again
+                    if what == Some(Page::Setup) {
+                        self.installing.clear();
+                        self.redetect();
+                    }
                     // a build installs a lib, so the card's state changes
                     if ok && what == Some(Page::Build) && !self.settings.rom.is_empty() {
                         worker::inspect(self.out.clone(), PathBuf::from(&self.settings.rom));
@@ -187,12 +238,19 @@ impl App {
     fn start(&mut self, job: Job, what: Page) {
         let cancel = Arc::new(AtomicBool::new(false));
         self.outcome = None;
+        self.exe = None;
         // a blank line between jobs
         if !self.log.is_empty() {
             self.log.push(Line { level: Level::Info, text: String::new() });
         }
-        self.running =
-            Some(Running { what, cancel: cancel.clone(), started: Instant::now(), stage: "Starting".into(), progress: None });
+        self.running = Some(Running {
+            what,
+            cancel: cancel.clone(),
+            started: Instant::now(),
+            stage: "Starting".into(),
+            progress: None,
+            step: 0,
+        });
         worker::run(self.out.clone(), job, cancel);
     }
 
@@ -200,8 +258,53 @@ impl App {
         matches!(self.title, Some(Ok(_))).then(|| PathBuf::from(&self.settings.rom))
     }
 
-    fn compiler_ok(&self) -> bool {
-        matches!(self.compiler, Some(Ok(_)))
+    fn library_compiler(&self) -> Option<recomp3ds::compile::Compiler> {
+        self.tools.as_ref().and_then(|tools| tools.library.clone().ok())
+    }
+
+    /// looks for the tools again, after something got installed or the settings changed
+    fn redetect(&mut self) {
+        self.tools = None;
+        worker::detect(self.out.clone(), worker::compiler_from(&self.settings.compiler));
+    }
+
+    /// the port job the settings describe, for the advanced page or (w/ simple) simple mode's exe
+    fn port_job(&self, simple: bool) -> Option<Job> {
+        let tools = self.tools.as_ref()?;
+        let (compiler, ar) = tools.exe.clone().ok()?;
+        let rom = self.rom()?;
+        let Some(Ok(info)) = &self.title else { return None };
+        if simple {
+            // the project lives in the cache, and every game shares one target folder so Zakuro gets compiled once
+            let work = recomp3ds::build::cache_dir(info.program_id);
+            let target = work.parent().map(|root| root.join("programs"))?;
+            let copy_to = optional(&self.settings.exe_dir).or_else(|| rom.parent().map(Path::to_owned))?;
+            return Some(Job::Port(Port {
+                rom,
+                dir: work.join("program"),
+                overrides: None,
+                name: None,
+                zakuro: None,
+                compiler,
+                ar,
+                cargo: Some(tools.cargo.clone().ok()?),
+                target: Some(target),
+                copy_to: Some(copy_to),
+            }));
+        }
+        let cargo = if self.settings.port_project_only { None } else { Some(tools.cargo.clone().ok()?) };
+        Some(Job::Port(Port {
+            rom,
+            dir: PathBuf::from(self.settings.port_dir.trim()),
+            overrides: optional(&self.settings.overrides),
+            name: Some(self.settings.port_name.trim().to_owned()).filter(|name| !name.is_empty()),
+            zakuro: optional(&self.settings.zakuro),
+            compiler,
+            ar,
+            cargo,
+            target: None,
+            copy_to: None,
+        }))
     }
 }
 
@@ -293,7 +396,7 @@ fn status(ui: &mut egui::Ui, color: Color32, text: &str) -> egui::Response {
         ui.spacing_mut().item_spacing.x = 6.0;
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
         ui.painter().circle_filled(rect.center(), 4.5, color);
-        ui.label(RichText::new(text).color(theme::TEXT));
+        ui.add(egui::Label::new(RichText::new(text).color(theme::TEXT)).wrap());
     })
     .response
 }
@@ -329,19 +432,37 @@ impl eframe::App for App {
         // panels sit flush against each other, each puts the spacing back inside
         ui.spacing_mut().item_spacing = Vec2::ZERO;
         self.header(ui);
-        self.sidebar(ui);
+        if self.settings.advanced {
+            self.sidebar(ui);
+        }
         self.log_panel(ui);
         egui::CentralPanel::default_margins()
             .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(18)))
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = theme::SPACING;
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    self.game_card(ui);
-                    ui.add_space(12.0);
-                    self.page(ui);
+                    if self.settings.advanced {
+                        self.game_card(ui);
+                        ui.add_space(12.0);
+                        self.page(ui);
+                    } else {
+                        // a column of its own, not stretched across a wide window
+                        let width = ui.available_width().min(760.0);
+                        let side = (ui.available_width() - width) / 2.0;
+                        ui.horizontal(|ui| {
+                            ui.add_space(side);
+                            ui.vertical(|ui| {
+                                ui.set_width(width);
+                                self.game_card(ui);
+                                ui.add_space(12.0);
+                                self.exe_page(ui);
+                            });
+                        });
+                    }
                 });
             });
 
+        self.setup_window(&ctx);
         self.drop_overlay(&ctx);
     }
 }
@@ -363,12 +484,33 @@ impl App {
                         ui.label(RichText::new("static recompiler for 3DS games").size(11.5).color(WEAK));
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let response = match &self.compiler {
-                            None => status(ui, WEAK, "Looking for a C compiler…"),
-                            Some(Ok(name)) => status(ui, GOOD, &format!("C compiler: {name}")),
-                            Some(Err(_)) => status(ui, BAD, "No C compiler, see Settings"),
+                        let busy = self.running.is_some();
+                        ui.add_enabled_ui(!busy, |ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            for (advanced, text) in [(true, "Advanced"), (false, "Simple")] {
+                                let selected = self.settings.advanced == advanced;
+                                let button =
+                                    egui::Button::new(RichText::new(text).color(if selected { Color32::WHITE } else { WEAK }))
+                                        .fill(if selected { theme::ACCENT_DIM } else { theme::CARD })
+                                        .min_size(Vec2::new(84.0, 28.0));
+                                if ui.add(button).on_disabled_hover_text("Wait for the job to finish").clicked() {
+                                    self.settings.advanced = advanced;
+                                }
+                            }
+                        });
+                        ui.add_space(16.0);
+                        let response = match (&self.tools, self.settings.advanced) {
+                            (None, _) => status(ui, WEAK, "Looking for tools…"),
+                            (Some(tools), false) if tools.exe_ready() => status(ui, GOOD, "Ready to make exes"),
+                            (Some(_), false) => status(ui, BAD, "A tool is missing"),
+                            (Some(tools), true) => match &tools.library {
+                                Ok(compiler) => status(ui, GOOD, &format!("C compiler: {}", short(compiler))),
+                                Err(_) => status(ui, BAD, "No usable C compiler, see Settings"),
+                            },
                         };
-                        if response.interact(Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        if self.settings.advanced
+                            && response.interact(Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+                        {
                             self.settings.page = Page::Settings;
                         }
                     });
@@ -511,9 +653,22 @@ impl App {
                             }
                         });
                     });
+                    // only advanced mode builds the library Zakuro loads
+                    if !self.settings.advanced {
+                        return;
+                    }
                     ui.add_space(4.0);
                     ui.separator();
                     ui.horizontal(|ui| match &info.installed {
+                        Some(path) if info.broken => {
+                            status(ui, BAD, "The installed library was built for Cygwin and crashes Zakuro, build it again");
+                            let path = path.clone();
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.small_button("Show file").clicked() {
+                                    reveal(&path);
+                                }
+                            });
+                        }
                         Some(path) => {
                             status(ui, GOOD, "A recompiled library is installed, Zakuro uses it for this game");
                             let path = path.clone();
@@ -554,6 +709,7 @@ impl App {
             Page::Port => self.port_page(ui),
             Page::Hints => self.hints_page(ui),
             Page::Settings => self.settings_page(ui),
+            Page::Exe | Page::Setup => self.exe_page(ui),
         }
     }
 
@@ -618,14 +774,260 @@ impl App {
         if self.rom().is_none() {
             return Err("Pick a game first");
         }
-        if compiler && !self.compiler_ok() {
-            return Err(if self.compiler.is_none() {
-                "Looking for a C compiler…"
-            } else {
-                "No C compiler found, see Settings"
+        match &self.tools {
+            None if compiler => Err("Looking for a C compiler…"),
+            Some(tools) if compiler && tools.library.is_err() => Err("No usable C compiler, see Settings"),
+            _ => Ok(()),
+        }
+    }
+
+    /// what making an exe still needs, if anything
+    fn needs_exe(&self) -> Result<(), &'static str> {
+        if self.rom().is_none() {
+            return Err("Pick a game first");
+        }
+        match &self.tools {
+            None => Err("Looking for tools…"),
+            Some(tools) if !tools.exe_ready() => Err("Install what's missing first"),
+            _ => Ok(()),
+        }
+    }
+
+    /// simple mode, the game in and an exe out
+    fn exe_page(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new(Page::Exe.label()).size(22.0).strong().color(Color32::WHITE));
+        hint(ui, Page::Exe.blurb());
+        ui.add_space(6.0);
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section(ui, "Where the exe goes");
+            path_field(ui, &mut self.settings.exe_dir, "the game's folder", &[Picked::Folder], None);
+            hint(ui, "The exe still reads your game for everything but its code, so keep the game where it is. A Play .bat next to the exe starts it with this game.");
+        });
+        if let Some(tools) = self.tools.clone().filter(|tools| !tools.exe_ready()) {
+            ui.add_space(10.0);
+            self.missing_tools(ui, &tools);
+        }
+        ui.add_space(10.0);
+        if self.controls(ui, Page::Exe, "▶  Make the exe", self.needs_exe(), true) {
+            if let Some(job) = self.port_job(true) {
+                self.start(job, Page::Exe);
+            }
+        }
+        let running = self.running.as_ref().filter(|running| running.what == Page::Exe).map(|running| running.step);
+        let finished = self.outcome.as_ref().filter(|(what, _, _)| *what == Page::Exe).map(|(_, ok, _)| *ok);
+        if running.is_some() || finished.is_some() {
+            ui.add_space(6.0);
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                for (i, step) in worker::PORT_STEPS.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+                        let state = match (running, finished) {
+                            (Some(at), _) => i.cmp(&at),
+                            (None, Some(true)) => std::cmp::Ordering::Less,
+                            _ => std::cmp::Ordering::Greater,
+                        };
+                        let color = match state {
+                            std::cmp::Ordering::Less => {
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "✔",
+                                    egui::FontId::proportional(14.0),
+                                    GOOD,
+                                );
+                                theme::TEXT
+                            }
+                            std::cmp::Ordering::Equal => {
+                                egui::Spinner::new().size(14.0).color(ACCENT).paint_at(ui, rect.shrink(2.0));
+                                Color32::WHITE
+                            }
+                            std::cmp::Ordering::Greater => {
+                                ui.painter().circle_stroke(rect.center(), 5.0, Stroke::new(1.5, theme::BORDER));
+                                WEAK
+                            }
+                        };
+                        ui.label(RichText::new(*step).color(color));
+                    });
+                }
+                if running == Some(2) {
+                    hint(ui, "The first exe takes a while: Zakuro gets downloaded and compiled once, later games reuse it.");
+                }
             });
         }
-        Ok(())
+        if let (Some(exe), Some(true)) = (self.exe.clone(), finished) {
+            ui.add_space(6.0);
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new("Your exe is ready").size(17.0).strong().color(GOOD));
+                ui.label(RichText::new(exe.display().to_string()).monospace().color(WEAK));
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new("▶  Play").fill(ACCENT).min_size(Vec2::new(100.0, 32.0))).clicked() {
+                        let mut command = std::process::Command::new(&exe);
+                        command.arg(&self.settings.rom);
+                        if let Some(dir) = exe.parent() {
+                            command.current_dir(dir);
+                        }
+                        if let Err(error) = command.spawn() {
+                            self.log
+                                .push(Line { level: Level::Error, text: format!("could not start {}, {error}", exe.display()) });
+                        }
+                    }
+                    if ui.add(egui::Button::new("📁  Show in folder").min_size(Vec2::new(140.0, 32.0))).clicked() {
+                        reveal(&exe);
+                    }
+                });
+            });
+        }
+    }
+
+    /// what's missing for making exes, w/ a way to the setup
+    fn missing_tools(&mut self, ui: &mut egui::Ui, tools: &Tools) {
+        theme::card().stroke(Stroke::new(1.0, WARN.gamma_multiply(0.6))).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("⚠  Something this needs isn't installed").strong().color(WARN));
+            let missing: Vec<&str> = RECIPES.iter().filter(|recipe| !tools.has(recipe)).map(|recipe| recipe.name).collect();
+            if missing.is_empty() {
+                // something found but unusable, like an LLVM w/o llvm-ar
+                for error in [tools.exe.as_ref().err(), tools.cargo.as_ref().err(), tools.linker.as_ref().err()].into_iter().flatten() {
+                    ui.label(error);
+                }
+            } else {
+                ui.label(format!("Missing: {}", missing.join(", ")));
+            }
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(RichText::new("🔧  Set up the tools").color(Color32::WHITE)).fill(ACCENT)).clicked() {
+                    self.show_setup = true;
+                }
+                if ui.button("Check again").clicked() {
+                    self.redetect();
+                }
+            });
+        });
+    }
+
+    /// the window that installs what making an exe takes, w/ winget
+    fn setup_window(&mut self, ctx: &egui::Context) {
+        if !self.show_setup {
+            return;
+        }
+        let installing = self.running.as_ref().filter(|running| running.what == Page::Setup);
+        let busy = self.running.is_some();
+        let now = installing.map(|running| (self.installing.get(running.step).map(|recipe| recipe.tool), running.stage.clone(), running.started.elapsed().as_secs()));
+        let frame = theme::card().inner_margin(egui::Margin::same(22)).shadow(egui::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(140) });
+        let modal = egui::Modal::new(egui::Id::unique("setup")).frame(frame).show(ctx, |ui| {
+            ui.set_width(580.0);
+            ui.spacing_mut().item_spacing = theme::SPACING;
+            ui.label(RichText::new("🔧  Set up 3dsrecomp").size(21.0).strong().color(Color32::WHITE));
+            hint(ui, "Making a game into an exe takes three free tools. Whatever's missing can be installed from here with winget, Windows' own package manager. Windows asks for permission for each one, and installing accepts its license.");
+            ui.add_space(4.0);
+            let Some(tools) = self.tools.clone() else {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().color(ACCENT));
+                    ui.label("Looking for what's installed…");
+                });
+                return;
+            };
+            for recipe in &RECIPES {
+                let has = tools.has(recipe);
+                egui::Frame::new().fill(theme::BG).corner_radius(8.0).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                        if now.as_ref().is_some_and(|(tool, _, _)| *tool == Some(recipe.tool)) {
+                            egui::Spinner::new().size(16.0).color(ACCENT).paint_at(ui, rect.shrink(2.0));
+                        } else if has {
+                            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "✔", egui::FontId::proportional(16.0), GOOD);
+                        } else {
+                            ui.painter().circle_stroke(rect.center(), 6.0, Stroke::new(1.5, WARN));
+                        }
+                        // room on the right for the button
+                        let text_width = (ui.available_width() - 100.0).max(160.0);
+                        ui.vertical(|ui| {
+                            ui.set_max_width(text_width);
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.label(RichText::new(recipe.name).strong().color(Color32::WHITE));
+                            let what = RichText::new(format!("{}, {}", recipe.what, recipe.size)).size(12.0).color(WEAK);
+                            ui.add(egui::Label::new(what).wrap());
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if has {
+                                ui.label(RichText::new("Installed").color(GOOD));
+                            } else if tools.winget {
+                                if ui.add_enabled(!busy, egui::Button::new("Install")).clicked() {
+                                    self.install(vec![recipe]);
+                                }
+                            } else {
+                                ui.hyperlink_to("Download", recipe.page);
+                            }
+                        });
+                    });
+                });
+            }
+            ui.add_space(6.0);
+            let missing: Vec<&'static Recipe> = RECIPES.iter().filter(|recipe| !tools.has(recipe)).collect();
+            if let Some((_, stage, elapsed)) = &now {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().color(ACCENT));
+                    ui.add(egui::Label::new(RichText::new(stage).strong()).truncate());
+                });
+                ui.horizontal(|ui| {
+                    hint(ui, &format!("{}:{:02} · the log at the bottom shows everything", elapsed / 60, elapsed % 60));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let stopping = self.running.as_ref().is_some_and(|running| running.cancel.load(Ordering::Relaxed));
+                        if ui.add_enabled(!stopping, egui::Button::new(if stopping { "Stopping…" } else { "■ Stop" })).clicked() {
+                            if let Some(running) = &self.running {
+                                running.cancel.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    });
+                });
+                if self.installing.get(self.running.as_ref().map_or(0, |running| running.step)).is_some_and(|recipe| recipe.tool == crate::toolchain::Tool::BuildTools) {
+                    hint(ui, "The Visual Studio Installer shows its own window while it works, this one takes the longest.");
+                }
+                return;
+            }
+            if let Some((_, false, summary)) = self.outcome.as_ref().filter(|(what, _, _)| *what == Page::Setup) {
+                ui.label(RichText::new(format!("✖  {summary}")).color(BAD));
+            }
+            if missing.is_empty() {
+                ui.label(RichText::new("✔  Everything's ready, you can make exes now").strong().color(GOOD));
+                if let Err(error) = &tools.exe {
+                    ui.label(RichText::new(error).color(WARN));
+                }
+            } else if !tools.winget {
+                hint(ui, "winget isn't available here, so download them from the links, install them, then check again.");
+            }
+            ui.horizontal(|ui| {
+                if !missing.is_empty() && tools.winget {
+                    let label = format!("Install what's missing ({})", missing.len());
+                    let button = egui::Button::new(RichText::new(label).strong().color(Color32::WHITE)).fill(ACCENT).min_size(Vec2::new(0.0, 34.0));
+                    if ui.add_enabled(!busy, button).clicked() {
+                        self.install(missing.clone());
+                    }
+                }
+                if ui.add_enabled(!busy, egui::Button::new("Check again").min_size(Vec2::new(0.0, 34.0))).clicked() {
+                    self.redetect();
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let close = if missing.is_empty() { "Done" } else { "Skip for now" };
+                    if ui.add(egui::Button::new(close).min_size(Vec2::new(0.0, 34.0))).clicked() {
+                        self.show_setup = false;
+                    }
+                });
+            });
+        });
+        // Esc or a click outside closes it, but not while it's installing
+        if modal.should_close() && now.is_none() {
+            self.show_setup = false;
+        }
+    }
+
+    /// starts installing recipes w/ winget
+    fn install(&mut self, recipes: Vec<&'static Recipe>) {
+        self.installing = recipes.clone();
+        self.start(Job::Install(recipes), Page::Setup);
     }
 
     fn build_page(&mut self, ui: &mut egui::Ui) {
@@ -656,7 +1058,7 @@ impl App {
                 rom: self.rom().unwrap(),
                 dir: if self.settings.build_to_folder { optional(&self.settings.build_dir) } else { None },
                 overrides: optional(&self.settings.overrides),
-                compiler: worker::compiler_from(&self.settings.compiler),
+                compiler: self.library_compiler(),
                 background: self.settings.background,
             };
             self.start(job, Page::Build);
@@ -683,34 +1085,42 @@ impl App {
             ui.add_space(6.0);
             section(ui, "Overrides (optional)");
             path_field(ui, &mut self.settings.overrides, "none", &[Picked::File, Picked::Folder], Some(("C files", &["c"])));
+            ui.add_space(6.0);
+            ui.checkbox(&mut self.settings.port_project_only, "Only write the project, don't build the exe")
+                .on_hover_text("Leaves cargo build --release to you");
         });
+        if let Some(tools) =
+            self.tools.clone().filter(|tools| tools.exe.is_err() || (!self.settings.port_project_only && tools.cargo.is_err()))
+        {
+            ui.add_space(10.0);
+            self.missing_tools(ui, &tools);
+        }
         ui.add_space(10.0);
-        let mut ready = self.needs(true);
+        let mut ready = self.needs(false);
         if ready.is_ok() && self.settings.port_dir.trim().is_empty() {
             ready = Err("Pick the project folder");
         }
-        if self.controls(ui, Page::Port, "▶  Make the project", ready, true) {
-            let job = Job::Port {
-                rom: self.rom().unwrap(),
-                dir: PathBuf::from(self.settings.port_dir.trim()),
-                overrides: optional(&self.settings.overrides),
-                name: Some(self.settings.port_name.trim().to_owned()).filter(|name| !name.is_empty()),
-                zakuro: optional(&self.settings.zakuro),
-                compiler: worker::compiler_from(&self.settings.compiler),
-            };
-            self.start(job, Page::Port);
+        if ready.is_ok() && self.port_job(false).is_none() {
+            ready = Err(if self.tools.is_none() { "Looking for tools…" } else { "Install what's missing first" });
+        }
+        let label = if self.settings.port_project_only { "▶  Make the project" } else { "▶  Make and build it" };
+        if self.controls(ui, Page::Port, label, ready, true) {
+            if let Some(job) = self.port_job(false) {
+                self.start(job, Page::Port);
+            }
         }
         let ported = self.outcome.as_ref().is_some_and(|(what, ok, _)| *what == Page::Port && *ok);
         if ported && !self.settings.port_dir.is_empty() && self.running.is_none() {
             let dir = PathBuf::from(&self.settings.port_dir);
-            if dir.join("Cargo.toml").is_file() {
-                ui.horizontal(|ui| {
-                    hint(ui, "Build it with cargo build --release in the project folder, which still needs the game to run.");
-                    if ui.small_button("Open folder").clicked() {
-                        reveal(&dir);
-                    }
-                });
-            }
+            ui.horizontal(|ui| {
+                match &self.exe {
+                    Some(exe) => hint(ui, &format!("Built {}, run it with the path to the game.", exe.display())),
+                    None => hint(ui, "Build it with cargo build --release in the project folder."),
+                }
+                if ui.small_button("Open folder").clicked() {
+                    reveal(self.exe.as_deref().unwrap_or(&dir));
+                }
+            });
         }
     }
 
@@ -859,33 +1269,59 @@ impl App {
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             section(ui, "C compiler");
-            hint(ui, "Leave empty to find one on its own (gcc, then clang). On Windows, MinGW-w64's gcc from MSYS2 or WinLibs works. A command with arguments like \"zig cc\" works too.");
+            hint(ui, "Leave empty to find one on its own, on PATH or where LLVM, MSYS2 and WinLibs install. Making an exe needs LLVM's clang with Rust's default (MSVC) toolchain. A command with arguments like \"zig cc\" works too.");
             let before = self.settings.compiler.clone();
             path_field(ui, &mut self.settings.compiler, "find one on its own", &[Picked::File], Some(("Programs", &["exe"])));
             if before != self.settings.compiler && worth_checking(&before, &self.settings.compiler) {
-                self.compiler = None;
-                worker::detect(self.out.clone(), worker::compiler_from(&self.settings.compiler));
+                self.redetect();
             }
-            ui.horizontal(|ui| {
-                match &self.compiler {
-                    None => {
+            match self.tools.clone() {
+                None => {
+                    ui.horizontal(|ui| {
                         ui.add(egui::Spinner::new().size(14.0).color(ACCENT));
                         ui.label("Checking…");
-                    }
-                    Some(Ok(name)) => {
-                        status(ui, GOOD, &format!("{name} works"));
-                    }
-                    Some(Err(error)) => {
-                        status(ui, BAD, error);
-                    }
+                    });
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Check again").clicked() {
-                        self.compiler = None;
-                        worker::detect(self.out.clone(), worker::compiler_from(&self.settings.compiler));
-                    }
-                });
-            });
+                Some(tools) => {
+                    egui::Grid::new("tools").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+                        ui.label(RichText::new("For libraries").color(WEAK));
+                        match &tools.library {
+                            Ok(compiler) => status(ui, GOOD, &compiler.describe()),
+                            Err(error) => status(ui, BAD, error),
+                        };
+                        ui.end_row();
+                        ui.label(RichText::new("For exes").color(WEAK));
+                        match &tools.exe {
+                            Ok((compiler, ar)) => status(ui, GOOD, &format!("{} with {}", compiler.describe(), ar.display())),
+                            Err(error) => status(ui, BAD, error),
+                        };
+                        ui.end_row();
+                        ui.label(RichText::new("Cargo").color(WEAK));
+                        match &tools.cargo {
+                            Ok(cargo) => status(ui, GOOD, &cargo.display().to_string()),
+                            Err(error) => status(ui, BAD, error),
+                        };
+                        ui.end_row();
+                        if cfg!(windows) {
+                            ui.label(RichText::new("Build Tools").color(WEAK));
+                            match &tools.linker {
+                                Ok(path) if path.as_os_str().is_empty() => status(ui, GOOD, "not needed"),
+                                Ok(path) => status(ui, GOOD, &path.display().to_string()),
+                                Err(error) => status(ui, BAD, error),
+                            };
+                            ui.end_row();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("🔧  Open setup").clicked() {
+                            self.show_setup = true;
+                        }
+                        if ui.button("Check again").clicked() {
+                            self.redetect();
+                        }
+                    });
+                }
+            }
         });
         ui.add_space(10.0);
         theme::card().show(ui, |ui| {
@@ -968,6 +1404,12 @@ impl App {
 }
 
 /// whether a new compiler field is worth checking, every keystroke would run one per letter otherwise
+/// a compiler's program name w/o its folder, for the header
+fn short(compiler: &recomp3ds::compile::Compiler) -> String {
+    let name = compiler.program.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
+    std::iter::once(name).chain(compiler.leading.iter().cloned()).collect::<Vec<_>>().join(" ")
+}
+
 fn worth_checking(before: &str, after: &str) -> bool {
     after.is_empty() || Path::new(after.trim()).is_file() || (after.len() as isize - before.len() as isize).abs() > 1
 }

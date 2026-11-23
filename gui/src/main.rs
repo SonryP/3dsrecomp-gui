@@ -7,6 +7,7 @@
 mod app;
 mod report;
 mod theme;
+mod toolchain;
 mod worker;
 
 /// names where the app keeps its settings, apart from the folder the libs get installed in
