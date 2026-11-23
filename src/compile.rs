@@ -64,6 +64,7 @@ impl Compiler {
     fn command(&self) -> Command {
         let mut command = Command::new(&self.program);
         command.args(&self.leading);
+        hide(&mut command);
         command
     }
 
@@ -96,11 +97,34 @@ fn lower(command: &mut Command) {
 fn lower(command: &mut Command) {
     use std::os::windows::process::CommandExt;
     const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
-    command.creation_flags(BELOW_NORMAL_PRIORITY_CLASS);
+    command.creation_flags(BELOW_NORMAL_PRIORITY_CLASS | hidden());
 }
 
 #[cfg(not(any(unix, windows)))]
 fn lower(_: &mut Command) {}
+
+/// on windows a program w/o a console (like the gui) would get a console window popping up per compiler, this keeps them hidden
+/// one run from a terminal shares that terminal like always
+#[cfg(windows)]
+fn hide(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(hidden());
+}
+
+#[cfg(not(windows))]
+fn hide(_: &mut Command) {}
+
+/// CREATE_NO_WINDOW when this process has no console of its own, else nothing
+#[cfg(windows)]
+fn hidden() -> u32 {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetConsoleWindow() -> *mut std::ffi::c_void;
+    }
+    // safe bc it takes nothing and only answers
+    if unsafe { GetConsoleWindow() }.is_null() { CREATE_NO_WINDOW } else { 0 }
+}
 
 /// memory the system can spare, MemAvailable on linux and free physical memory on windows, or none if it can't tell
 fn spare_memory() -> Option<u64> {
@@ -299,6 +323,7 @@ pub fn archive(objects: &[PathBuf], library: &Path) -> Result<(), String> {
         .unwrap_or_else(|| "ar".to_owned());
     let library = std::path::absolute(library).map_err(|e| format!("archiving failed, {e}"))?;
     let mut command = Command::new(&ar);
+    hide(&mut command);
     let objects = from_folder(&mut command, objects);
     finished(command.arg("rcs").arg(library).args(objects).status(), "archiving")
 }

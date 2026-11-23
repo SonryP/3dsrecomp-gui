@@ -11,7 +11,7 @@ name = "3dsrecomp"
 path = "src/main.rs"
 
 [workspace]
-members = ["abi"]
+members = ["abi", "gui"]
 
 [features]
 # loading a recompiled lib from rust

@@ -54,6 +54,17 @@ cd mygame && cargo build --release
 
 build and port both take --overrides with a C file or a folder of them, for functions written by hand.
 
+### The app
+
+There's also a desktop app that does analyze, build, port and hints without the terminal. Pick a game (or drop it on the window), press Build, and watch the log and progress bar. It still needs a C compiler, the same as the command line, and says so at the top if it can't find one.
+
+```
+cargo build --release -p recomp3ds-gui
+./target/release/3dsrecomp-gui
+```
+
+On Windows that makes `3dsrecomp-gui.exe`, a program of its own you can copy anywhere. You can also drop a game on the exe to open it right away.
+
 ## Notes
 
 This repository doesn't contain any game code. You need your own dump of a game you own, and since the generated C, libraries and programs come from the game, don't share them.
