@@ -1131,7 +1131,8 @@ mod tests {
             std::fs::write(dir.join(name), text).unwrap();
         }
         let sources: Vec<String> = sources.iter().map(|s| s.to_string()).collect();
-        let compiler = crate::compile::check(None).expect("a C compiler");
+        // any compiler that runs tells whether the C is right, even one that builds for cygwin
+        let compiler = crate::compile::Compiler::find().filter(crate::compile::Compiler::runs).expect("a C compiler");
         let built = crate::compile::objects(&compiler, &dir, &sources, &|_, _| true, false);
         std::fs::remove_dir_all(&dir).ok();
         built.unwrap();

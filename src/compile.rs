@@ -42,7 +42,9 @@ impl Compiler {
             return Some(Compiler::named(&named));
         }
         let compilers: &[&str] = if cfg!(windows) { &["gcc", "clang", "cc"] } else { &["cc", "gcc", "clang"] };
-        compilers.iter().map(|name| Compiler::new(name, &[])).find(Compiler::runs)
+        let running: Vec<Compiler> = compilers.iter().map(|name| Compiler::new(name, &[])).filter(Compiler::runs).collect();
+        // one building for cygwin only gets picked when there's nothing else, so check can say why it won't do
+        running.iter().find(|compiler| !compiler.builds_for_cygwin()).or(running.first()).cloned()
     }
 
     /// what CC holds, a program or a program plus leading args split by spaces, like zig cc
@@ -72,6 +74,19 @@ impl Compiler {
     fn is_gcc(&self) -> bool {
         let output = self.command().arg("--version").output();
         output.is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("Free Software Foundation"))
+    }
+
+    /// the target it builds for, what -dumpmachine says (x86_64-w64-mingw32, x86_64-pc-windows-msvc...)
+    pub fn target(&self) -> Option<String> {
+        let output = self.command().arg("-dumpmachine").stderr(Stdio::null()).output().ok()?;
+        let target = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        (output.status.success() && !target.is_empty()).then_some(target)
+    }
+
+    /// on windows, does it build for cygwin or msys (like MSYS2's and devkitPro's /usr/bin/gcc)
+    /// what those make needs msys-2.0.dll, and a lib like that crashes the emu that loads it
+    pub fn builds_for_cygwin(&self) -> bool {
+        cfg!(windows) && self.target().is_some_and(|target| target.contains("cygwin") || target.contains("msys"))
     }
 
     /// how it's called, for messages
@@ -168,6 +183,12 @@ fn spare_memory() -> Option<u64> {
 pub fn check(given: Option<&Compiler>) -> Result<Compiler, String> {
     let compiler = given.cloned().or_else(Compiler::find);
     if let Some(compiler) = compiler.as_ref().filter(|compiler| compiler.runs()) {
+        if compiler.builds_for_cygwin() {
+            return Err(format!(
+                "{} builds for Cygwin/MSYS instead of Windows, what it makes needs msys-2.0.dll and crashes, install MinGW-w64's gcc (MSYS2's mingw64 or ucrt64, or WinLibs) or LLVM's clang, or name one in CC",
+                compiler.describe()
+            ));
+        }
         return Ok(compiler.clone());
     }
     let name = compiler.map(|compiler| compiler.describe()).unwrap_or_else(|| if cfg!(windows) { "gcc" } else { "cc" }.to_owned());
@@ -310,19 +331,24 @@ fn finished(status: std::io::Result<ExitStatus>, what: &str) -> Result<(), Strin
     }
 }
 
-/// puts objects into a static lib
+/// puts objects into a static lib, w/ whatever AR names or the first of ar and llvm-ar that runs
 pub fn archive(objects: &[PathBuf], library: &Path) -> Result<(), String> {
-    // ar adds to what's there, which could hold objects no longer built
-    if library.exists() {
-        std::fs::remove_file(library).map_err(|e| format!("could not replace {}, {e}", library.display()))?;
-    }
     let ar = std::env::var("AR")
         .ok()
         .filter(|name| !name.is_empty())
         .or_else(|| ["ar", "llvm-ar"].into_iter().find(|tool| Compiler::new(tool, &[]).runs()).map(str::to_owned))
         .unwrap_or_else(|| "ar".to_owned());
+    archive_with(Path::new(&ar), objects, library)
+}
+
+/// puts objects into a static lib w/ the ar given, for when it has to match the compiler (llvm-ar for clang's objects)
+pub fn archive_with(ar: &Path, objects: &[PathBuf], library: &Path) -> Result<(), String> {
+    // ar adds to what's there, which could hold objects no longer built
+    if library.exists() {
+        std::fs::remove_file(library).map_err(|e| format!("could not replace {}, {e}", library.display()))?;
+    }
     let library = std::path::absolute(library).map_err(|e| format!("archiving failed, {e}"))?;
-    let mut command = Command::new(&ar);
+    let mut command = Command::new(ar);
     hide(&mut command);
     let objects = from_folder(&mut command, objects);
     finished(command.arg("rcs").arg(library).args(objects).status(), "archiving")
