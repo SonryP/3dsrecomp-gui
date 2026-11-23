@@ -4,6 +4,8 @@ name: CI
 on:
   push:
   pull_request:
+  # a run started by hand from the Actions tab
+  workflow_dispatch:
 
 jobs:
   test:
